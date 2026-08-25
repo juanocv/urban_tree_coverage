@@ -217,11 +217,21 @@ a 640x640 frame is roughly a megabyte of PNG and each view carries three, so
 `/multi` refuses a plan larger than `UC_API_MAX_OVERLAY_VIEWS` (default 8)
 rather than serving a response nobody asked to receive.
 
-The API has no authentication and calls a paid Google API on every request —
-keep it behind a proxy or bound to localhost.
+`UC_API_TOKENS` (comma-separated) turns on bearer authentication: `/ready` and
+both `/analyse` endpoints then require `Authorization: Bearer <token>`, while
+`GET /ping` stays open for liveness probes. Left empty the API is
+unauthenticated, which is fine on localhost and reckless anywhere else — it calls
+a paid Google API on every request, so an open instance spends your quota for
+whoever finds it. Startup logs which mode is active.
+
+Nothing here rate-limits: the concurrency semaphore bounds how many inferences
+run at once, not how many a token holder may run. Set a budget cap on the Google
+side too.
 
 A static web console for this API lives in
-[urban_canopy-web](https://github.com/juanocv/urban_canopy-web).
+[urban_canopy-web](https://github.com/juanocv/urban_canopy-web). For additional info
+on how to expose the API to the internet, check the _tunneling_ documentation in that 
+repository's README.
 
 ## Ground truth and evaluation
 

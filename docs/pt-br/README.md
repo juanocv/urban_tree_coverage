@@ -219,11 +219,22 @@ e cada vista carrega três, então o `/multi` recusa um plano maior que
 `UC_API_MAX_OVERLAY_VIEWS` (padrão 8) em vez de servir uma resposta que ninguém
 pediu para receber.
 
-A API não tem autenticação e chama uma API paga do Google a cada requisição —
-mantenha-a atrás de um proxy ou presa ao localhost.
+O `UC_API_TOKENS` (separado por vírgulas) liga a autenticação bearer: `/ready` e
+os dois endpoints `/analyse` passam a exigir `Authorization: Bearer <token>`,
+enquanto o `GET /ping` continua aberto para sondas de liveness. Vazio, a API fica
+sem autenticação — tudo bem no localhost e imprudente em qualquer outro lugar,
+porque ela chama uma API paga do Google a cada requisição: uma instância aberta
+gasta sua cota para quem a encontrar. A inicialização registra qual modo está
+ativo.
 
-Um console web estático para esta API está em
-[urban_canopy-web](https://github.com/juanocv/urban_canopy-web).
+Nada aqui limita taxa: o semáforo de concorrência limita quantas inferências
+rodam ao mesmo tempo, não quantas um portador de token pode fazer. Defina também
+um teto de orçamento do lado do Google.
+
+Um console web estático para esta API encontra-se disponível em
+[urban_canopy-web](https://github.com/juanocv/urban_canopy-web). Para mais
+informações em como expor essa API na internet, veja a documentação sobre
+_tunneling_ no README deste repositório.
 
 ## Ground truth e avaliação
 

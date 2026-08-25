@@ -31,19 +31,33 @@ and several requests can overlap. The segmentation model behind them is neither
 thread-safe nor cheap in VRAM, so model work is serialised through a semaphore
 sized by ``UC_API_MAX_CONCURRENCY`` (default 1).
 
-The API has no authentication and calls a paid Google API on every request --
-keep it behind a proxy or bound to localhost.
+Authentication
+--------------
+Off by default, which keeps a localhost instance as convenient as the CLI.
+Setting ``UC_API_TOKENS`` to a comma-separated list of secrets turns on bearer
+authentication for everything except ``GET /ping``: requests must carry
+``Authorization: Bearer <token>``. Startup logs which mode is active, loudly,
+because the difference decides whether strangers can spend the Google quota this
+service is billed for.
+
+Tokens are compared in constant time, but they are still bearer secrets: an
+instance reachable from the internet wants TLS in front of it, so the token is
+not readable on the wire. Nothing here does rate limiting -- the inference
+semaphore bounds concurrency, not spend.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
 import threading
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from dotenv import dotenv_values
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from urban_canopy.log import configure_logging, get_logger
@@ -61,20 +75,74 @@ from urban_canopy.validation import (
 configure_logging(force=False)
 logger = get_logger(__name__)
 
+# BackendSettings reads .env for its own fields via pydantic-settings; every
+# UC_API_* setting in this module is read separately, with a plain os.getenv
+# fallback to values parsed from the same file. dotenv_values() only returns a
+# dict -- unlike load_dotenv(), it never writes into os.environ, so importing
+# this module (for testing, type-checking, or anything short of actually
+# running the server) has no effect on any other code sharing the interpreter.
+_DOTENV_VALUES = dotenv_values(".env")
+
+
+def _env(key: str, default: str) -> str:
+    """A real environment variable always wins over the .env fallback."""
+    return os.environ.get(key) or _DOTENV_VALUES.get(key) or default
+
+
 # Serialises model work; see the module docstring.
-MAX_CONCURRENCY = max(1, int(os.getenv("UC_API_MAX_CONCURRENCY", "1")))
+MAX_CONCURRENCY = max(1, int(_env("UC_API_MAX_CONCURRENCY", "1")))
 _inference_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 # Ceiling on how many views may carry overlays in one multi-view response.
-MAX_OVERLAY_VIEWS = max(1, int(os.getenv("UC_API_MAX_OVERLAY_VIEWS", "8")))
+MAX_OVERLAY_VIEWS = max(1, int(_env("UC_API_MAX_OVERLAY_VIEWS", "8")))
 
-CORS_ORIGINS = [o.strip() for o in os.getenv("UC_API_CORS_ORIGINS", "*").split(",") if o.strip()]
+
+def _configured_tokens() -> frozenset[str]:
+    """Accepted bearer tokens; empty means the instance is unauthenticated."""
+    raw = _env("UC_API_TOKENS", "") or _env("UC_API_TOKEN", "")
+    return frozenset(token.strip() for token in raw.split(",") if token.strip())
+
+
+API_TOKENS = _configured_tokens()
+
+_bearer_scheme = HTTPBearer(auto_error=False, description="UC_API_TOKENS entry")
+
+
+def require_token(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)] = None,
+) -> None:
+    """
+    Gate an endpoint behind ``UC_API_TOKENS``.
+
+    With no tokens configured this is a no-op, so a localhost instance behaves
+    exactly as it always has; startup says so in the log rather than leaving the
+    operator to infer it.
+    """
+    if not API_TOKENS:
+        return
+
+    unauthorised = HTTPException(
+        401,
+        "Authentication required: send Authorization: Bearer <token>",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise unauthorised
+
+    supplied = credentials.credentials.encode("utf-8")
+    # Every candidate is compared in full: a plain `==` would leak the token
+    # prefix through response timing.
+    if not any(secrets.compare_digest(supplied, known.encode("utf-8")) for known in API_TOKENS):
+        raise unauthorised
+
+
+CORS_ORIGINS = [o.strip() for o in _env("UC_API_CORS_ORIGINS", "*").split(",") if o.strip()]
 
 
 @contextmanager
 def _inference_slot():
     """Hold one of the model-inference slots for the duration of the block."""
-    acquired = _inference_slots.acquire(timeout=float(os.getenv("UC_API_QUEUE_TIMEOUT_S", "300")))
+    acquired = _inference_slots.acquire(timeout=float(_env("UC_API_QUEUE_TIMEOUT_S", "300")))
     if not acquired:
         raise HTTPException(503, "Server busy: inference queue timed out")
     try:
@@ -129,6 +197,22 @@ async def lifespan(app: FastAPI):
         backend_settings.backend,
         MAX_CONCURRENCY,
     )
+    if API_TOKENS:
+        logger.info(
+            "Bearer authentication is ON (%s token(s) accepted); /ping stays open.",
+            len(API_TOKENS),
+        )
+    else:
+        logger.warning(
+            "Bearer authentication is OFF: every caller can reach /analyse and spend "
+            "the configured Google API quota. Set UC_API_TOKENS before exposing this "
+            "instance beyond localhost."
+        )
+    if API_TOKENS and CORS_ORIGINS == ["*"]:
+        logger.warning(
+            "UC_API_CORS_ORIGINS is '*': any page may call this API with a token it "
+            "holds. Pin it to the origins you serve the console from."
+        )
     segmenter = build_segmenter_from_settings(backend_settings)
     streetview = uc.StreetViewClient()
 
@@ -285,7 +369,7 @@ def ping() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/ready")
+@app.get("/ready", dependencies=[Depends(require_token)])
 def ready() -> dict[str, Any]:
     provenance = getattr(app.state, "backend_provenance", None)
     if provenance is None:
@@ -293,7 +377,7 @@ def ready() -> dict[str, Any]:
     return {"status": "ready", "backend": provenance}
 
 
-@app.post("/analyse/single")
+@app.post("/analyse/single", dependencies=[Depends(require_token)])
 def analyse_single(req: SingleViewRequest) -> dict[str, Any]:
     lat, lon = _resolve_location(req)
     pipe = app.state.registry.get(
@@ -319,7 +403,7 @@ def analyse_single(req: SingleViewRequest) -> dict[str, Any]:
     return payload
 
 
-@app.post("/analyse/multi")
+@app.post("/analyse/multi", dependencies=[Depends(require_token)])
 def analyse_multi(req: MultiViewRequest) -> dict[str, Any]:
     from urban_canopy.core.viewplan import ViewPlanConfig, plan_headings
 

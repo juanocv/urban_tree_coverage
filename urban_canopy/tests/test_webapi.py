@@ -35,6 +35,22 @@ class StubSegmenter:
         )
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_config(monkeypatch):
+    """
+    Hermetic defaults: tests must never inherit settings from whatever
+    ``.env`` happens to sit in the developer's or CI's working directory.
+
+    ``webapi`` reads ``UC_API_*`` values once at import time -- both into
+    ``API_TOKENS`` and into the ``_DOTENV_VALUES`` fallback dict -- so an env
+    var set after import would not apply anyway; patching the attributes
+    directly is the only thing that reaches every request. Tests that want
+    auth on use the ``guarded`` fixture below, which overrides ``API_TOKENS``.
+    """
+    monkeypatch.setattr(webapi, "API_TOKENS", frozenset())
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     frame = tmp_path / "sv.jpg"
@@ -246,3 +262,107 @@ def test_multi_view_overlays_skip_views_without_imagery(client, monkeypatch):
     views = response.json()["views"]
     assert "overlays" not in views[0]
     assert "overlays" in views[1]
+
+
+# ------------------------------------------------------------------ #
+# Bearer authentication                                              #
+# ------------------------------------------------------------------ #
+@pytest.fixture()
+def guarded(client, monkeypatch):
+    """The same client, with two tokens configured."""
+    monkeypatch.setattr(webapi, "API_TOKENS", frozenset({"correct-horse", "second-key"}))
+    return client
+
+
+def test_tokens_are_read_from_either_env_name(monkeypatch):
+    # _DOTENV_VALUES is parsed once, from whatever .env sits on this machine;
+    # patch it too, so this test's outcome does not depend on that file.
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
+    monkeypatch.delenv("UC_API_TOKEN", raising=False)
+    monkeypatch.setenv("UC_API_TOKENS", " alpha , beta ,, ")
+    assert webapi._configured_tokens() == frozenset({"alpha", "beta"})
+
+    monkeypatch.delenv("UC_API_TOKENS", raising=False)
+    monkeypatch.setenv("UC_API_TOKEN", "solo")
+    assert webapi._configured_tokens() == frozenset({"solo"})
+
+    monkeypatch.delenv("UC_API_TOKEN", raising=False)
+    assert webapi._configured_tokens() == frozenset()
+
+
+def test_tokens_fall_back_to_the_env_file_when_unset_in_the_process(monkeypatch):
+    """A token only present in .env still takes effect -- the original bug."""
+    monkeypatch.delenv("UC_API_TOKENS", raising=False)
+    monkeypatch.delenv("UC_API_TOKEN", raising=False)
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {"UC_API_TOKENS": "from-the-file"})
+    assert webapi._configured_tokens() == frozenset({"from-the-file"})
+
+    # A real process env var still overrides the file, matching every other
+    # UC_API_* setting.
+    monkeypatch.setenv("UC_API_TOKENS", "from-the-environment")
+    assert webapi._configured_tokens() == frozenset({"from-the-environment"})
+
+
+def test_unauthenticated_instance_stays_open(client):
+    """No tokens configured means the localhost workflow is untouched."""
+    assert client.get("/ready").status_code == 200
+    assert client.post("/analyse/single", json={"lat": -23.0, "lon": -46.0}).status_code == 200
+
+
+def test_ping_is_reachable_without_a_token(guarded):
+    """Liveness has to answer probes that hold no secret."""
+    response = guarded.get("/ping")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("get", "/ready", None),
+        ("post", "/analyse/single", {"lat": -23.0, "lon": -46.0}),
+        ("post", "/analyse/multi", {"lat": -23.0, "lon": -46.0, "offsets": [0]}),
+    ],
+)
+def test_guarded_endpoints_reject_a_missing_token(guarded, method, path, body):
+    response = getattr(guarded, method)(path, **({"json": body} if body else {}))
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Bearer wrong-token",
+        "Bearer correct-horse-extra",
+        "Bearer correct-hors",
+        "Basic correct-horse",
+        "correct-horse",
+        "Bearer ",
+    ],
+)
+def test_guarded_endpoints_reject_a_bad_token(guarded, header):
+    response = guarded.get("/ready", headers={"Authorization": header})
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("token", ["correct-horse", "second-key"])
+def test_any_configured_token_is_accepted(guarded, token):
+    response = guarded.get("/ready", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+def test_analysis_succeeds_with_a_token(guarded):
+    response = guarded.post(
+        "/analyse/single",
+        json={"lat": -23.0, "lon": -46.0},
+        headers={"Authorization": "Bearer second-key"},
+    )
+    assert response.status_code == 200
+    assert response.json()["coverage"]["tree_coverage_pct"] == pytest.approx(50.0)
+
+
+def test_bearer_scheme_is_case_insensitive(guarded):
+    response = guarded.get("/ready", headers={"Authorization": "bearer correct-horse"})
+    assert response.status_code == 200

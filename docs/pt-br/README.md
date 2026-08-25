@@ -210,6 +210,22 @@ liveness; `GET /ready` confirma a inicialização do modelo e devolve a mesma
 proveniência, incluindo um SHA-256 quando os pesos são locais. A documentação
 interativa fica em `/docs`. A avaliação de datasets permanece na CLI.
 
+Os dois endpoints de análise aceitam um campo `backend`, de modo que quem chama
+escolhe o backend de segmentação por requisição, em vez de conviver com o que o
+`UC_SEG_BACKEND` definiu na inicialização. Omitir o campo usa esse padrão. Os
+backends carregam no primeiro uso e permanecem residentes, então nada se paga
+por um backend que ninguém pede; o `UC_API_BACKENDS` restringe a oferta numa
+máquina com pouca VRAM. O `GET /ready` lista o que a instância oferece, marcando
+cada entrada como `loaded`, `available` ou `unavailable` com o motivo — o
+suficiente para um cliente desabilitar o que não pode usar.
+
+É isso que torna o `allow_vegetation_proxy` alcançável na prática: ele não muda
+nada num backend que já tem classe de árvore, e só importa no `deeplab`, cujo
+espaço de classes Cityscapes funde árvores em `vegetation`. Escolher esse backend
+e deixar o proxy desligado reporta nenhuma cobertura arbórea, que é a resposta
+honesta; ligá-lo reporta o número de vegetação com
+`tree_source="vegetation_proxy"` e um sinalizador de qualidade dizendo isso.
+
 Os dois endpoints de análise aceitam `return_overlays` (desligado por padrão),
 que acrescenta PNGs em base64 do quadro RGB, da sobreposição de árvores e da
 máscara refinada — no `/single` sob uma chave `overlays` no topo, no `/multi`

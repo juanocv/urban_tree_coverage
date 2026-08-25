@@ -48,6 +48,7 @@ semaphore bounds concurrency, not spend.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import secrets
 import threading
@@ -62,10 +63,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from urban_canopy.log import configure_logging, get_logger
 from urban_canopy.models.backend_settings import (
+    BackendName,
     BackendSettings,
     backend_provenance,
     build_segmenter_from_settings,
 )
+from urban_canopy.models.factory import BACKEND_CLASS_SPACE, BACKENDS
 from urban_canopy.validation import (
     validate_image_size,
     validate_latitude,
@@ -95,6 +98,30 @@ _inference_slots = threading.BoundedSemaphore(MAX_CONCURRENCY)
 
 # Ceiling on how many views may carry overlays in one multi-view response.
 MAX_OVERLAY_VIEWS = max(1, int(_env("UC_API_MAX_OVERLAY_VIEWS", "8")))
+
+
+def _enabled_backends() -> tuple[str, ...]:
+    """
+    Backends this instance will serve, in the order they are offered.
+
+    Every backend by default. Each one a request actually uses stays resident
+    for the life of the process, so an instance short on VRAM can narrow the
+    list rather than discover the limit under load.
+    """
+    raw = _env("UC_API_BACKENDS", "").strip()
+    if not raw:
+        return tuple(BACKENDS)
+    chosen = [name.strip() for name in raw.split(",") if name.strip()]
+    unknown = [name for name in chosen if name not in BACKENDS]
+    if unknown:
+        raise ValueError(
+            f"UC_API_BACKENDS lists unknown backend(s): {', '.join(unknown)}. "
+            f"Valid names: {', '.join(BACKENDS)}."
+        )
+    return tuple(chosen)
+
+
+ENABLED_BACKENDS = _enabled_backends()
 
 
 def _configured_tokens() -> frozenset[str]:
@@ -151,31 +178,123 @@ def _inference_slot():
         _inference_slots.release()
 
 
-class PipelineRegistry:
+def settings_for_backend(base: BackendSettings, backend: str) -> BackendSettings:
     """
-    Lazily builds and caches one pipeline per configuration knob that changes
-    behaviour (refinement on/off, vegetation proxy on/off). The segmenter and
-    Street View client are shared across all of them: they are the expensive
-    parts and they are configuration-independent.
+    Copy *base* with a different backend selected.
+
+    ``model_name`` is dropped when the backend changes: a checkpoint configured
+    through ``UC_SEG_MODEL`` names weights for one specific backend, and
+    carrying it across would either fail to load or -- worse -- load something
+    whose class space does not match what the taxonomy expects.
+    """
+    if backend == base.backend:
+        return base
+    return base.model_copy(update={"backend": backend, "model_name": None})
+
+
+def backend_availability(settings: BackendSettings, backend: str) -> tuple[bool, str]:
+    """
+    Whether *backend* could be built, without paying to build it.
+
+    Cheap checks only -- an import spec and a file on disk. A backend that
+    passes here can still fail to load (a corrupt checkpoint, no VRAM); it just
+    will not fail for the two reasons that are worth reporting up front.
+    """
+    if backend in ("oneformer", "mask2former"):
+        if importlib.util.find_spec("transformers") is None:
+            return False, 'transformers is not installed; pip install -e ".[ml]"'
+        return True, ""
+
+    if backend == "detectron2":
+        if importlib.util.find_spec("detectron2") is None:
+            return False, "Detectron2 is not installed; see docs/detectron2-windows.md"
+        return True, ""
+
+    if backend == "deeplab":
+        if settings.deeplab_checkpoint is None:
+            return False, "UC_DEEPLAB_CKPT is not set"
+        if not settings.deeplab_checkpoint.is_file():
+            return False, f"checkpoint not found: {settings.deeplab_checkpoint}"
+        if settings.deeplab_repo is not None and not settings.deeplab_repo.is_dir():
+            return False, f"UC_DEEPLAB_REPO not found: {settings.deeplab_repo}"
+        return True, ""
+
+    return False, f"unknown backend {backend!r}"
+
+
+class SegmenterRegistry:
+    """
+    One segmenter per backend, built on first use and kept afterwards.
+
+    Eager loading of every backend would multiply startup time and VRAM by four
+    for a service that usually answers with one of them, so a backend costs
+    nothing until a request names it. It is never unloaded: releasing a Torch
+    model's device memory reliably is not something this can promise, and
+    pretending otherwise would trade a predictable ceiling for an unpredictable
+    one. ``UC_API_BACKENDS`` is the honest control -- it caps which backends an
+    instance is willing to hold at all.
     """
 
-    def __init__(self, segmenter: Any, streetview: Any) -> None:
-        self._segmenter = segmenter
-        self._streetview = streetview
-        self._pipes: dict[tuple[bool, bool, bool], Any] = {}
+    def __init__(self, settings: BackendSettings) -> None:
+        self._settings = settings
+        self._segmenters: dict[str, Any] = {}
+        self._provenance: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def get(self, *, refine: bool, allow_vegetation_proxy: bool, keep_rgb: bool = False):
+    def get(self, backend: str) -> tuple[Any, dict[str, Any]]:
+        """The segmenter for *backend* and its provenance, building on demand."""
+        with self._lock:
+            if backend not in self._segmenters:
+                settings = settings_for_backend(self._settings, backend)
+                logger.info("Loading segmentation backend %r", backend)
+                segmenter = build_segmenter_from_settings(settings)
+                self._segmenters[backend] = segmenter
+                self._provenance[backend] = backend_provenance(segmenter, settings)
+                logger.info("Backend %r ready", backend)
+            return self._segmenters[backend], self._provenance[backend]
+
+    def loaded(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._segmenters))
+
+
+class PipelineRegistry:
+    """
+    Lazily builds and caches one pipeline per combination that changes
+    behaviour: the backend, and the configuration knobs (refinement on/off,
+    vegetation proxy on/off, RGB retained or not). Segmenters come from the
+    SegmenterRegistry and are shared; the Street View client is shared by all of
+    them, being configuration-independent.
+    """
+
+    def __init__(self, segmenters: SegmenterRegistry, streetview: Any) -> None:
+        self._segmenters = segmenters
+        self._streetview = streetview
+        self._pipes: dict[tuple[str, bool, bool, bool], Any] = {}
+        self._lock = threading.Lock()
+
+    def get(
+        self,
+        *,
+        backend: str,
+        refine: bool,
+        allow_vegetation_proxy: bool,
+        keep_rgb: bool = False,
+    ):
         from urban_canopy.core.config import CanopyConfig
         from urban_canopy.core.pipeline import CanopyPipeline
         from urban_canopy.processing.refinement import RefinementConfig
 
-        key = (refine, allow_vegetation_proxy, keep_rgb)
+        # Built outside the pipeline lock: loading a backend is slow, and it has
+        # a lock of its own.
+        segmenter, provenance = self._segmenters.get(backend)
+
+        key = (backend, refine, allow_vegetation_proxy, keep_rgb)
         with self._lock:
             pipe = self._pipes.get(key)
             if pipe is None:
                 pipe = CanopyPipeline(
-                    segmenter=self._segmenter,
+                    segmenter=segmenter,
                     streetview=self._streetview,
                     config=CanopyConfig(
                         refinement=RefinementConfig(enabled=refine),
@@ -184,7 +303,7 @@ class PipelineRegistry:
                     ),
                 )
                 self._pipes[key] = pipe
-            return pipe
+            return pipe, provenance
 
 
 @asynccontextmanager
@@ -213,13 +332,29 @@ async def lifespan(app: FastAPI):
             "UC_API_CORS_ORIGINS is '*': any page may call this API with a token it "
             "holds. Pin it to the origins you serve the console from."
         )
-    segmenter = build_segmenter_from_settings(backend_settings)
+    if backend_settings.backend not in ENABLED_BACKENDS:
+        raise RuntimeError(
+            f"UC_SEG_BACKEND={backend_settings.backend!r} is not in UC_API_BACKENDS "
+            f"({', '.join(ENABLED_BACKENDS)}); the default must be one this instance serves."
+        )
+
     streetview = uc.StreetViewClient()
+    segmenters = SegmenterRegistry(backend_settings)
 
     app.state.backend_settings = backend_settings
-    app.state.backend_provenance = backend_provenance(segmenter, backend_settings)
-    app.state.registry = PipelineRegistry(segmenter, streetview)
-    app.state.registry.get(refine=True, allow_vegetation_proxy=False)
+    app.state.segmenters = segmenters
+    app.state.registry = PipelineRegistry(segmenters, streetview)
+
+    # Only the default is loaded now: it makes /ready meaningful and the first
+    # request fast, without paying for backends nobody may ask for.
+    _, provenance = segmenters.get(backend_settings.backend)
+    app.state.backend_provenance = provenance
+
+    offered = [
+        f"{name}{'' if backend_availability(backend_settings, name)[0] else ' (unavailable)'}"
+        for name in ENABLED_BACKENDS
+    ]
+    logger.info("Backends offered: %s; default is %s", ", ".join(offered), backend_settings.backend)
     logger.info("Urban Canopy API ready")
     yield
 
@@ -256,6 +391,13 @@ class SingleViewRequest(BaseModel):
     pitch: int = Field(0, ge=-90, le=90)
     fov: int = Field(90, ge=10, le=120)
     size: str = "640x640"
+    backend: BackendName | None = Field(
+        None,
+        description=(
+            "Segmentation backend; defaults to the instance's UC_SEG_BACKEND. "
+            "Which backends are offered is listed by GET /ready."
+        ),
+    )
     refine: bool = True
     allow_vegetation_proxy: bool = False
     return_overlays: bool = Field(
@@ -298,6 +440,13 @@ class MultiViewRequest(BaseModel):
     pitch: int = Field(0, ge=-90, le=90)
     fov: int = Field(90, ge=10, le=120)
     size: str = "640x640"
+    backend: BackendName | None = Field(
+        None,
+        description=(
+            "Segmentation backend; defaults to the instance's UC_SEG_BACKEND. "
+            "Which backends are offered is listed by GET /ready."
+        ),
+    )
     refine: bool = True
     allow_vegetation_proxy: bool = False
     return_overlays: bool = Field(
@@ -345,6 +494,26 @@ def _resolve_location(req) -> tuple[float, float]:
     raise HTTPException(422, "Either address or lat+lon is required")
 
 
+def _resolve_backend(requested: str | None) -> str:
+    """The backend to serve this request with, refusing one we cannot honour."""
+    settings = app.state.backend_settings
+    backend = requested or settings.backend
+
+    if backend not in ENABLED_BACKENDS:
+        raise HTTPException(
+            422,
+            f"backend {backend!r} is not offered by this instance; "
+            f"available: {', '.join(ENABLED_BACKENDS)}",
+        )
+
+    available, reason = backend_availability(settings, backend)
+    if not available:
+        # 503, not 422: the request is well formed, the server just cannot
+        # satisfy it in its current configuration.
+        raise HTTPException(503, f"backend {backend!r} is not usable here: {reason}")
+    return backend
+
+
 def _overlays(result) -> dict[str, str]:
     import cv2
     import numpy as np
@@ -374,17 +543,48 @@ def ready() -> dict[str, Any]:
     provenance = getattr(app.state, "backend_provenance", None)
     if provenance is None:
         raise HTTPException(503, "Backend is not ready")
-    return {"status": "ready", "backend": provenance}
+
+    settings = app.state.backend_settings
+    loaded = app.state.segmenters.loaded()
+    backends = []
+    for name in ENABLED_BACKENDS:
+        available, reason = backend_availability(settings, name)
+        backends.append(
+            {
+                "name": name,
+                # "loaded" is the strongest claim available without building it:
+                # this one has already answered a request in this process.
+                "status": (
+                    "loaded" if name in loaded else ("available" if available else "unavailable")
+                ),
+                "reason": reason or None,
+                "default": name == settings.backend,
+                "class_space": BACKEND_CLASS_SPACE.get(name),
+            }
+        )
+    return {
+        "status": "ready",
+        "backend": provenance,
+        "default_backend": settings.backend,
+        "backends": backends,
+    }
 
 
 @app.post("/analyse/single", dependencies=[Depends(require_token)])
 def analyse_single(req: SingleViewRequest) -> dict[str, Any]:
     lat, lon = _resolve_location(req)
-    pipe = app.state.registry.get(
-        refine=req.refine,
-        allow_vegetation_proxy=req.allow_vegetation_proxy,
-        keep_rgb=req.return_overlays,
-    )
+    backend = _resolve_backend(req.backend)
+    try:
+        pipe, provenance = app.state.registry.get(
+            backend=backend,
+            refine=req.refine,
+            allow_vegetation_proxy=req.allow_vegetation_proxy,
+            keep_rgb=req.return_overlays,
+        )
+    except Exception as exc:
+        logger.exception("Loading backend %r failed", backend)
+        raise HTTPException(503, f"Could not load backend {backend!r}: {exc}") from exc
+
     with _inference_slot():
         try:
             result = pipe.analyse_coords(
@@ -395,7 +595,7 @@ def analyse_single(req: SingleViewRequest) -> dict[str, Any]:
             raise HTTPException(500, f"Analysis failed: {exc}") from exc
 
     payload = result.to_dict()
-    payload["backend_provenance"] = app.state.backend_provenance
+    payload["backend_provenance"] = provenance
     if req.address:
         payload["capture"]["address"] = req.address
     if req.return_overlays:
@@ -431,11 +631,18 @@ def analyse_multi(req: MultiViewRequest) -> dict[str, Any]:
             f"return_overlays is limited to {MAX_OVERLAY_VIEWS} planned headings; "
             f"this plan plans {planned_count}. Reduce the plan or omit the overlays.",
         )
-    pipe = app.state.registry.get(
-        refine=req.refine,
-        allow_vegetation_proxy=req.allow_vegetation_proxy,
-        keep_rgb=req.return_overlays,
-    )
+    backend = _resolve_backend(req.backend)
+    try:
+        pipe, provenance = app.state.registry.get(
+            backend=backend,
+            refine=req.refine,
+            allow_vegetation_proxy=req.allow_vegetation_proxy,
+            keep_rgb=req.return_overlays,
+        )
+    except Exception as exc:
+        logger.exception("Loading backend %r failed", backend)
+        raise HTTPException(503, f"Could not load backend {backend!r}: {exc}") from exc
+
     with _inference_slot():
         try:
             result = pipe.analyse_multiview(lat, lon, plan=plan, address=req.address)
@@ -448,7 +655,7 @@ def analyse_multi(req: MultiViewRequest) -> dict[str, Any]:
             raise HTTPException(500, f"Analysis failed: {exc}") from exc
 
     payload = result.to_dict()
-    payload["backend_provenance"] = app.state.backend_provenance
+    payload["backend_provenance"] = provenance
     if req.return_overlays:
         # `to_dict` builds one entry per view, in order, so the pairing holds.
         # strict=True keeps a future change to that contract from silently

@@ -31,9 +31,21 @@ ENV_EXAMPLE = Path(__file__).parents[2] / ".env.example"
 
 
 @pytest.fixture(autouse=True)
-def clean_backend_environment(monkeypatch):
+def clean_backend_environment(monkeypatch, tmp_path):
+    """
+    No ambient configuration: neither process variables nor a ``.env`` file.
+
+    Clearing the variables is not enough on its own. pydantic-settings reads
+    ``env_file=".env"`` itself, relative to the working directory, so a test run
+    from a checkout that has one silently inherits it -- which is exactly how
+    ``UC_TRUST_CHECKPOINT=1`` in a developer's own ``.env`` used to fail the
+    defaults test on their machine and nowhere else. Starting in an empty
+    directory makes "no environment" true. Tests that want a specific ``.env``
+    write one and chdir to it themselves; the later chdir wins.
+    """
     for key in BACKEND_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 class _Segmenter:

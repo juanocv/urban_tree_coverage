@@ -51,6 +51,11 @@ def _no_ambient_config(monkeypatch):
     monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
 
 
+def pipeline_key(*flags: bool) -> tuple:
+    """The registry key for the instance's default backend plus *flags*."""
+    return (webapi.app.state.backend_settings.backend, *flags)
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     frame = tmp_path / "sv.jpg"
@@ -117,13 +122,13 @@ def test_single_view_overlays(client):
     assert response.status_code == 200
     overlays = response.json()["overlays"]
     assert set(overlays) == {"rgb_png_b64", "overlay_tree_png_b64", "mask_refined_png_b64"}
-    assert (True, False, True) in webapi.app.state.registry._pipes
+    assert pipeline_key(True, False, True) in webapi.app.state.registry._pipes
 
 
 def test_single_view_without_overlays_uses_non_rgb_pipeline(client):
     response = client.post("/analyse/single", json={"lat": -23.0, "lon": -46.0})
     assert response.status_code == 200
-    assert (True, False, False) in webapi.app.state.registry._pipes
+    assert pipeline_key(True, False, False) in webapi.app.state.registry._pipes
 
 
 @pytest.mark.parametrize(
@@ -206,7 +211,7 @@ def test_multi_view_overlays(client):
             "mask_refined_png_b64",
         }
     # Overlays need the RGB-retaining pipeline, same as the single-view endpoint.
-    assert (True, False, True) in webapi.app.state.registry._pipes
+    assert pipeline_key(True, False, True) in webapi.app.state.registry._pipes
 
 
 def test_multi_view_without_overlays_omits_them(client):
@@ -216,7 +221,7 @@ def test_multi_view_without_overlays_omits_them(client):
     )
     assert response.status_code == 200
     assert all("overlays" not in view for view in response.json()["views"])
-    assert (True, False, False) in webapi.app.state.registry._pipes
+    assert pipeline_key(True, False, False) in webapi.app.state.registry._pipes
 
 
 def test_multi_view_overlays_are_capped_by_plan_size(client, monkeypatch):
@@ -366,3 +371,189 @@ def test_analysis_succeeds_with_a_token(guarded):
 def test_bearer_scheme_is_case_insensitive(guarded):
     response = guarded.get("/ready", headers={"Authorization": "bearer correct-horse"})
     assert response.status_code == 200
+
+
+# ------------------------------------------------------------------ #
+# Backend selection                                                  #
+# ------------------------------------------------------------------ #
+class SecondStubSegmenter(StubSegmenter):
+    """A second identity, so a per-request backend switch is observable."""
+
+    backend_name = "stub-two"
+
+
+@pytest.fixture()
+def multi_backend(client, monkeypatch):
+    """Serve two backends, each building a distinguishable segmenter."""
+    monkeypatch.setattr(webapi, "ENABLED_BACKENDS", ("oneformer", "mask2former"))
+    monkeypatch.setattr(webapi, "backend_availability", lambda settings, backend: (True, ""))
+    monkeypatch.setattr(
+        webapi,
+        "build_segmenter_from_settings",
+        lambda settings: (
+            StubSegmenter() if settings.backend == "oneformer" else SecondStubSegmenter()
+        ),
+    )
+    # The registry built at startup captured the old builder; rebuild it so the
+    # per-backend one above is the one under test.
+    webapi.app.state.segmenters = webapi.SegmenterRegistry(webapi.app.state.backend_settings)
+    webapi.app.state.registry = webapi.PipelineRegistry(
+        webapi.app.state.segmenters, webapi.app.state.registry._streetview
+    )
+    return client
+
+
+def test_settings_for_backend_drops_a_backend_specific_checkpoint():
+    from urban_canopy.models.backend_settings import BackendSettings
+
+    base = BackendSettings(backend="oneformer", model_name="shi-labs/oneformer_ade20k_swin_large")
+    assert webapi.settings_for_backend(base, "oneformer") is base
+
+    switched = webapi.settings_for_backend(base, "mask2former")
+    assert switched.backend == "mask2former"
+    assert switched.model_name is None, "a OneFormer checkpoint must not follow to Mask2Former"
+
+
+def test_enabled_backends_defaults_to_every_backend(monkeypatch):
+    from urban_canopy.models.factory import BACKENDS
+
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
+    monkeypatch.delenv("UC_API_BACKENDS", raising=False)
+    assert webapi._enabled_backends() == tuple(BACKENDS)
+
+
+def test_enabled_backends_can_be_narrowed(monkeypatch):
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
+    monkeypatch.setenv("UC_API_BACKENDS", " deeplab , oneformer ")
+    assert webapi._enabled_backends() == ("deeplab", "oneformer")
+
+
+def test_enabled_backends_rejects_an_unknown_name(monkeypatch):
+    monkeypatch.setattr(webapi, "_DOTENV_VALUES", {})
+    monkeypatch.setenv("UC_API_BACKENDS", "oneformer,not-a-backend")
+    with pytest.raises(ValueError, match="not-a-backend"):
+        webapi._enabled_backends()
+
+
+def test_readiness_lists_every_offered_backend(client):
+    payload = client.get("/ready").json()
+    names = [entry["name"] for entry in payload["backends"]]
+    assert names == list(webapi.ENABLED_BACKENDS)
+    assert payload["default_backend"] == webapi.app.state.backend_settings.backend
+
+    default_entry = next(e for e in payload["backends"] if e["default"])
+    assert default_entry["status"] == "loaded", "the default is built during startup"
+    assert all(e["status"] in {"loaded", "available", "unavailable"} for e in payload["backends"])
+
+
+def test_readiness_explains_an_unavailable_backend(client, monkeypatch):
+    monkeypatch.setattr(
+        webapi,
+        "backend_availability",
+        lambda settings, backend: (
+            (False, "checkpoint not found: /nope.pth") if backend == "deeplab" else (True, "")
+        ),
+    )
+    entries = {e["name"]: e for e in client.get("/ready").json()["backends"]}
+    if "deeplab" in entries:
+        assert entries["deeplab"]["status"] == "unavailable"
+        assert entries["deeplab"]["reason"] == "checkpoint not found: /nope.pth"
+
+
+def test_request_selects_the_backend(multi_backend):
+    first = multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "oneformer"}
+    )
+    second = multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "mask2former"}
+    )
+    assert first.status_code == second.status_code == 200
+    assert first.json()["backend_provenance"]["backend"] == "stub"
+    assert second.json()["backend_provenance"]["backend"] == "stub-two"
+
+
+def test_multi_view_selects_the_backend(multi_backend):
+    response = multi_backend.post(
+        "/analyse/multi",
+        json={"lat": -23.0, "lon": -46.0, "offsets": [0], "backend": "mask2former"},
+    )
+    assert response.status_code == 200
+    assert response.json()["backend_provenance"]["backend"] == "stub-two"
+
+
+def test_omitting_the_backend_uses_the_instance_default(multi_backend):
+    response = multi_backend.post("/analyse/single", json={"lat": -23.0, "lon": -46.0})
+    assert response.status_code == 200
+    default = webapi.app.state.backend_settings.backend
+    expected = "stub" if default == "oneformer" else "stub-two"
+    assert response.json()["backend_provenance"]["backend"] == expected
+
+
+def test_each_backend_gets_its_own_pipeline(multi_backend):
+    multi_backend.post("/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "oneformer"})
+    multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "mask2former"}
+    )
+    keys = webapi.app.state.registry._pipes
+    assert ("oneformer", True, False, False) in keys
+    assert ("mask2former", True, False, False) in keys
+
+
+def test_a_backend_outside_the_offer_is_refused(multi_backend):
+    response = multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "deeplab"}
+    )
+    assert response.status_code == 422
+    assert "not offered" in response.json()["detail"]
+
+
+def test_an_unusable_backend_is_a_service_error_not_a_bad_request(multi_backend, monkeypatch):
+    """A well-formed request the server cannot satisfy is 503, not 422."""
+    monkeypatch.setattr(
+        webapi,
+        "backend_availability",
+        lambda settings, backend: (
+            (False, "UC_DEEPLAB_CKPT is not set") if backend == "mask2former" else (True, "")
+        ),
+    )
+    response = multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "mask2former"}
+    )
+    assert response.status_code == 503
+    assert "UC_DEEPLAB_CKPT is not set" in response.json()["detail"]
+
+
+def test_a_backend_that_fails_to_load_reports_which_one(multi_backend, monkeypatch):
+    def explode(settings):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(webapi, "build_segmenter_from_settings", explode)
+    webapi.app.state.segmenters = webapi.SegmenterRegistry(webapi.app.state.backend_settings)
+    webapi.app.state.registry = webapi.PipelineRegistry(
+        webapi.app.state.segmenters, webapi.app.state.registry._streetview
+    )
+    response = multi_backend.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "mask2former"}
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "mask2former" in detail and "CUDA out of memory" in detail
+
+
+def test_an_invalid_backend_name_is_rejected_by_the_schema(client):
+    response = client.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "not-a-backend"}
+    )
+    assert response.status_code == 422
+
+
+def test_segmenters_are_built_once_and_reused(multi_backend):
+    for _ in range(3):
+        multi_backend.post(
+            "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": "mask2former"}
+        )
+    registry = webapi.app.state.segmenters
+    assert registry.loaded() == ("mask2former",), "only the requested backend is resident"
+    first, _ = registry.get("mask2former")
+    second, _ = registry.get("mask2former")
+    assert first is second

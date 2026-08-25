@@ -209,6 +209,22 @@ backend/checkpoint/taxonomy provenance. `GET /ping` is a liveness probe; `GET
 SHA-256 when weights are local. Interactive docs are at `/docs`. Dataset
 evaluation stays in the CLI.
 
+Both analysis endpoints accept a `backend` field, so a caller picks the
+segmentation backend per request rather than living with whatever
+`UC_SEG_BACKEND` was set to at startup. Omitting it uses that default. Backends
+load on first use and stay resident, so nothing is paid for a backend nobody
+asks for; `UC_API_BACKENDS` narrows the offer on a machine short on VRAM. `GET
+/ready` lists what the instance offers, each entry marked `loaded`, `available`
+or `unavailable` with the reason, which is enough for a client to grey out what
+it cannot use.
+
+This is what makes `allow_vegetation_proxy` reachable in practice: it changes
+nothing on a backend that already has a tree class, and only matters on
+`deeplab`, whose Cityscapes class space merges trees into `vegetation`. Selecting
+that backend and leaving the proxy off reports no tree coverage at all, which is
+the honest answer; turning it on reports the vegetation number with
+`tree_source="vegetation_proxy"` and a quality flag saying so.
+
 Both analysis endpoints accept `return_overlays` (default off), which adds
 base64 PNGs of the RGB frame, the tree overlay and the refined mask — on
 `/single` under a top-level `overlays` key, on `/multi` under `overlays` on each

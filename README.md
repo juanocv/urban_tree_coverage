@@ -229,7 +229,9 @@ run at once, not how many a token holder may run. Set a budget cap on the Google
 side too.
 
 A static web console for this API lives in
-[urban_canopy-web](https://github.com/juanocv/urban_canopy-web).
+[urban_canopy-web](https://github.com/juanocv/urban_canopy-web). For additional info
+on how to expose the API to the internet, check the _tunneling_ documentation in that 
+repository's README.
 
 ## Ground truth and evaluation
 

@@ -231,8 +231,10 @@ Nada aqui limita taxa: o semáforo de concorrência limita quantas inferências
 rodam ao mesmo tempo, não quantas um portador de token pode fazer. Defina também
 um teto de orçamento do lado do Google.
 
-Um console web estático para esta API está em
-[urban_canopy-web](https://github.com/juanocv/urban_canopy-web).
+Um console web estático para esta API encontra-se disponível em
+[urban_canopy-web](https://github.com/juanocv/urban_canopy-web). Para mais
+informações em como expor essa API na internet, veja a documentação sobre
+_tunneling_ no README deste repositório.
 
 ## Ground truth e avaliação
 

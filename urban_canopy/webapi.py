@@ -48,6 +48,7 @@ semaphore bounds concurrency, not spend.
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import os
 import secrets
@@ -364,9 +365,24 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def _package_version() -> str:
+    """
+    The installed package's version, for /docs and the OpenAPI document.
+
+    Read rather than repeated: a literal here is a second place to remember on
+    every release, and the one that silently keeps announcing the old number
+    when it is forgotten. Same idiom as the run manifest in core.config.
+    """
+    try:
+        return importlib.metadata.version("urban-canopy")
+    except importlib.metadata.PackageNotFoundError:
+        # Running from a source tree that was never installed.
+        return "0+unknown"
+
+
 app = FastAPI(
     title="Urban-Canopy",
-    version="0.1.0",
+    version=_package_version(),
     description="Visible tree-canopy coverage from Google Street View imagery.",
     lifespan=lifespan,
 )

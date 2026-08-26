@@ -10,8 +10,6 @@ page and the reproducibility manifest in every run both read it from the
 installed package metadata, so an editable checkout needs `pip install -e .`
 re-run after a bump for them to agree.
 
-## [Unreleased]
-
 ## [0.2.0] — 2026-08-26
 
 Web API only. The CLI, pipeline, evaluation and taxonomy are unchanged from

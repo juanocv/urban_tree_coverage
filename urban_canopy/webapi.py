@@ -350,8 +350,13 @@ async def lifespan(app: FastAPI):
     _, provenance = segmenters.get(backend_settings.backend)
     app.state.backend_provenance = provenance
 
+    loaded = segmenters.loaded()
     offered = [
-        f"{name}{'' if backend_availability(backend_settings, name)[0] else ' (unavailable)'}"
+        (
+            name
+            if name in loaded
+            else f"{name}{'' if backend_availability(backend_settings, name)[0] else ' (unavailable)'}"
+        )
         for name in ENABLED_BACKENDS
     ]
     logger.info("Backends offered: %s; default is %s", ", ".join(offered), backend_settings.backend)
@@ -505,6 +510,13 @@ def _resolve_backend(requested: str | None) -> str:
             f"backend {backend!r} is not offered by this instance; "
             f"available: {', '.join(ENABLED_BACKENDS)}",
         )
+
+    # A backend already loaded is usable by definition: whatever it took to
+    # build it has happened. Asking the pre-flight probe about it would let an
+    # import check overrule a working model -- which is what it did to an
+    # instance whose segmenter was injected rather than imported.
+    if backend in app.state.segmenters.loaded():
+        return backend
 
     available, reason = backend_availability(settings, backend)
     if not available:

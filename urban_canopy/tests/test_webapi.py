@@ -557,3 +557,53 @@ def test_segmenters_are_built_once_and_reused(multi_backend):
     first, _ = registry.get("mask2former")
     second, _ = registry.get("mask2former")
     assert first is second
+
+
+def test_a_loaded_backend_serves_even_when_nothing_is_importable(client, monkeypatch):
+    """
+    The pre-flight probe must not overrule a model that is already running.
+
+    This is the CI condition: the suite installs no ML extras, so every
+    availability check fails, while the segmenter under test was injected and
+    never needed them. A probe that could veto a working backend made every
+    analysis 503 there and nowhere else.
+    """
+    monkeypatch.setattr(
+        webapi, "backend_availability", lambda settings, backend: (False, "transformers missing")
+    )
+    default = webapi.app.state.backend_settings.backend
+    assert default in webapi.app.state.segmenters.loaded()
+
+    response = client.post("/analyse/single", json={"lat": -23.0, "lon": -46.0})
+    assert response.status_code == 200
+    assert response.json()["backend_provenance"]["backend"] == "stub"
+
+    multi = client.post("/analyse/multi", json={"lat": -23.0, "lon": -46.0, "offsets": [0]})
+    assert multi.status_code == 200
+
+
+def test_an_unloaded_backend_still_respects_the_probe(client, monkeypatch):
+    """The relaxation applies only to what is loaded; the rest is still gated."""
+    monkeypatch.setattr(webapi, "ENABLED_BACKENDS", ("oneformer", "mask2former", "deeplab"))
+    monkeypatch.setattr(
+        webapi,
+        "backend_availability",
+        lambda settings, backend: (False, "UC_DEEPLAB_CKPT is not set"),
+    )
+    unloaded = next(
+        name for name in webapi.ENABLED_BACKENDS if name not in webapi.app.state.segmenters.loaded()
+    )
+    response = client.post(
+        "/analyse/single", json={"lat": -23.0, "lon": -46.0, "backend": unloaded}
+    )
+    assert response.status_code == 503
+    assert "UC_DEEPLAB_CKPT is not set" in response.json()["detail"]
+
+
+def test_readiness_never_calls_a_loaded_backend_unavailable(client, monkeypatch):
+    monkeypatch.setattr(
+        webapi, "backend_availability", lambda settings, backend: (False, "transformers missing")
+    )
+    entries = {e["name"]: e for e in client.get("/ready").json()["backends"]}
+    default = webapi.app.state.backend_settings.backend
+    assert entries[default]["status"] == "loaded"

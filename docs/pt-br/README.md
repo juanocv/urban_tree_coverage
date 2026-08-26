@@ -298,6 +298,12 @@ A suíte padrão é offline e somente CPU; `pytest -m gpu` e `pytest -m network`
 rodam as verificações excluídas. Veja o [FAQ](faq.md#desenvolvimento) para o que
 cada gate cobra e por quê.
 
+## Changelog
+
+As notas de release ficam em [`CHANGELOG.md`](../../CHANGELOG.md). A versão do
+`pyproject.toml` é a única autoritativa — a página `/docs` da API e o manifesto
+de cada execução a leem da metadata do pacote instalado.
+
 ## Transparência sobre o uso de IA Generativa
 
 Ferramentas de IA generativa foram utilizadas como apoio durante a concepção e o 

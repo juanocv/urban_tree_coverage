@@ -293,6 +293,12 @@ The default suite is offline and CPU-only; `pytest -m gpu` and `pytest -m networ
 run the excluded checks. See the [FAQ](docs/faq.md#development) for what each
 gate enforces and why.
 
+## Changelog
+
+Release notes live in [`CHANGELOG.md`](CHANGELOG.md). The version in
+`pyproject.toml` is the only authoritative one — the API's `/docs` page and each
+run's manifest read it from the installed package metadata.
+
 ## Generative AI Usage Transparency
 
 Generative AI tools were used to support the conception and development of this project, 
